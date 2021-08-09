@@ -1,6 +1,10 @@
 # my ignore
 
 config.sh
+kaggle_api.sh
+input/
+*.ipynb
+src/utils.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -11,6 +11,14 @@ POETRY = curl -sSL https://raw.githubusercontent.com/python-poetry/poetry/master
 		&& source ~/.bashrc \
 		&& ${HOME}/.poetry/bin/poetry config virtualenvs.create false
 
+KAGGLE = bash ./kaggle_api.sh \
+		&& pip3 uninstall -y -q kaggle \
+		&& pip3 install --upgrade -q pip \
+		&& pip3 install -q kaggle==1.5.12
+
+kaggle_api:
+	@${KAGGLE}
+
 config: ## config for colab pro + ssh + vscode (e.g git config, and copy ssh credentials to communicatte with github)
 	@sh config.sh
 
