@@ -1,7 +1,7 @@
 SHELL=/bin/bash
 POETRY_VERSION=1.1.7
 PACKAGE = loguru wandb flake8 mypy black pyyaml pytorch-lightning \
-		jupytext madgrad albumentations timm
+		jupytext madgrad albumentations timm nnAudio
 
 SKLEARN = pip3 uninstall -y scikit-learn \
 	&& pip3 install --pre --extra-index https://pypi.anaconda.org/scipy-wheels-nightly/simple scikit-learn
@@ -27,6 +27,13 @@ poetry:
 
 develop: # usually use this command
 	pip3 install -q -U ${PACKAGE}
+
+set:
+	@sh config.sh \
+	&& pip3 install -q -U ${PACKAGE}
+
+set_tpu:
+	pip3 install cloud-tpu-client==0.10 https://storage.googleapis.com/tpu-pytorch/wheels/torch_xla-1.8-cp37-cp37m-linux_x86_64.whl
 
 pip_export:
 	pip3 freeze > requirements.txt

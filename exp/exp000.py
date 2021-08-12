@@ -1,18 +1,24 @@
+import sys
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
-import librosa
+# import librosa
 import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
 import timm
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import wandb
+from loguru import logger
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import CSVLogger, WandbLogger
 from sklearn.metrics import roc_auc_score
+from nnAudio.Spectrogram import CQT
+sys.path.append(str(Path.cwd()))
 from src import utils
 from torch.utils.data import DataLoader, Dataset
 
@@ -21,60 +27,70 @@ from torch.utils.data import DataLoader, Dataset
 # data
 # ============
 class MyG2NetDataset(Dataset):
-    def __init__(self, data_dir: Path, df=None, is_test: bool = False):
+    def __init__(
+        self,
+        data_dir: Path,
+        df=None,
+        is_test: bool = False,
+        is_valid: bool = False,
+        num_labels: int = 2,
+    ):
         super().__init__()
+        self.df = df
+        self.num_labels = num_labels
         self.data_dir = data_dir
         self.is_test = is_test
         if is_test:
             self.phase = "test"
-            self.id = df["id"].values
-            self.data_paths = self.get_data_path(self.phase)
         else:
             self.phase = "train"
-            self.id = df["id"].values
-            self.target = df["target"].values
-            self.data_paths = self.get_data_path(self.phase)
+            if is_valid:
+                self.phase = "valid"
+            self.target = np.identity(self.num_labels)[df["target"].values]
+        self.id = df["id"].values
+        self.data_paths = self.get_data_path(self.phase)
+        self.dtype = torch.half
 
     def __len__(self):
-        return len(self.target)
+        return len(self.df)
 
     def __getitem__(self, index):
         id_ = self.id[index]
-        data = self.get_data(id_)
+        data = self.get_data(index)
+        data = torch.tensor(data, dtype=self.dtype)
         if self.is_test:
-            return {"data": data}
+            return {"id": id_, "data": data}
         target = self.target[index]
-        return {"target": target, "data": data}
+        target = torch.tensor(target, dtype=self.dtype)
+        return {"id": id_, "target": target, "data": data}
 
     def get_data_path(self, phase):
-        assert phase in {"train", "test"}
-        data_paths = list(self.data_dir.glob(f"{phase}/*/*/*/*.npy"))
-        return data_paths
+        assert phase in {"train", "test", "valid"}
+        if phase == "test":
+            return list(self.data_dir.glob("test/*/*/*/*.npy"))
+        return list(self.data_dir.glob("train/*/*/*/*.npy"))
 
     def load_signal(self, path: Path):
-        return np.load(path)
-
-    def make_spectrogram(self, signal):
-        spectrogram = np.apply_along_axis(
-            partial(librosa.feature.melspectrogram, sr=2048)
-            1,
-            signal,
-        )
-        return spectrogram
+        signal = np.load(path)
+        signal = signal / np.max(signal, axis=1).reshape(3, 1)
+        signal = np.hstack(signal)
+        return signal.astype("float32")
 
     def get_data(self, index):
         path = self.data_paths[index]
         signal = self.load_signal(path)
-        images = self.make_spectrogram(signal)
-        return images
+        return signal
 
 
 class MyDataModule(pl.LightningDataModule):
     def __init__(self, config):
         super().__init__()
         # define by config
+        self.num_workers = config.num_workers
+        self.num_labels = config.num_labels
         self.data_dir = config.data_dir
         self.train_df_path = config.train_df_path
+        self.test_df_path = config.test_df_path
         self.fold = config.fold
         self.train_batch_size = config.train_batch_size
         self.valid_batch_size = config.valid_batch_size
@@ -84,7 +100,12 @@ class MyDataModule(pl.LightningDataModule):
         self.valid_df = None
 
     def load_train_df(self):
-        return pd.read_csv(self.train_df_path)
+        df = pd.read_csv(self.train_df_path)
+        return df
+
+    def load_test_df(self):
+        df = pd.read_csv(self.test_df_path)
+        return df
 
     def split_train_valid(self, df, fold):
         train_df = df[df["fold"] != fold].reset_index(drop=True)
@@ -92,33 +113,41 @@ class MyDataModule(pl.LightningDataModule):
         return train_df, valid_df
 
     def setup(self, stage):
+        test_df = self.load_test_df()
         train_df = self.load_train_df()
         train_df, valid_df = self.split_train_valid(train_df, fold=self.fold)
         self.train_df = train_df
         self.valid_df = valid_df
+        self.test_df = test_df
 
     def get_df(self, phase):
-        assert phase in {"train", "valid"}
+        assert phase in {"train", "valid", "test"}
         if phase == "train":
             return self.train_df
         elif phase == "valid":
             return self.valid_df
+        else:
+            return self.test_df
 
     def get_dataset(self, phase):
         dataset = MyG2NetDataset(
-            data_dir=self.data_dir, df=self.get_df(phase), is_test=(phase == "test")
+            data_dir=self.data_dir,
+            df=self.get_df(phase),
+            is_test=(phase == "test"),
+            is_valid=(phase == "valid"),
         )
         return dataset
 
     def get_batch_size(self, phase):
-        assert phase in {"train", "valid"}
+        assert phase in {"train", "valid", "test"}
         if phase == "train":
             return self.train_batch_size
         elif phase == "valid":
             return self.valid_batch_size
+        else:
+            return self.test_batch_size
 
     def get_loader(self, phase):
-        # TODO: shuffleとかは考えた方がいいかも
         dataset = self.get_dataset(phase=phase)
         return DataLoader(
             dataset,
@@ -131,7 +160,7 @@ class MyDataModule(pl.LightningDataModule):
     def train_dataloader(self):
         return self.get_loader(phase="train")
 
-    def valid_dataloader(self):
+    def val_dataloader(self):
         return self.get_loader(phase="valid")
 
     def test_dataloader(self):
@@ -143,6 +172,7 @@ class MyDataModule(pl.LightningDataModule):
 # ============
 class Custom2LinearHead(nn.Module):
     def __init__(self, in_features, hidden_size, out_features, drop_rate=0.5):
+        super(Custom2LinearHead, self).__init__()
         self.in_features = in_features
         self.hiddin_size = hidden_size
         self.out_features = out_features
@@ -159,22 +189,36 @@ class Custom2LinearHead(nn.Module):
 
 class G2NetModel(nn.Module):
     def __init__(self, config):
+        super(G2NetModel, self).__init__()
         self.backbone_name = config.backbone_name
-        self.model = timm.create_model(self.backbone_name, pretrained=config.pretrained)
-        self.head = Custom2LinearHead(in_features=1000, hidden_size=256, out_features=2)
+        self.backbone = timm.create_model(
+            self.backbone_name, pretrained=config.pretrained, in_chans=1
+        )
+        self.head = Custom2LinearHead(
+            in_features=1000, hidden_size=256, out_features=config.num_labels
+        )
+        self.wave_transform = CQT(
+            sr=2048,
+            fmin=20,
+            fmax=1024,
+            hop_length=64,
+            bins_per_octave=8,
+        )
 
     def forward(self, x):
-        x = self.model(x)
+        x = self.wave_transform(x)
+        x = x.unsqueeze(1)
+        x = self.backbone(x)
         output = self.head(x)
         return output
 
 
 class G2NetLitModel(pl.LightningModule):
     def __init__(self, config):
-        super().__init__()
+        super(G2NetLitModel, self).__init__()
         # model
         self.net = G2NetModel(config)
-        self.loss_fn = torch.nn.CrossEntropyLoss()
+        self.loss_fn = torch.nn.BCEWithLogitsLoss()
         self.score_fn = roc_auc_score
 
         # training config
@@ -185,7 +229,7 @@ class G2NetLitModel(pl.LightningModule):
         self.save_hyperparameters()
 
     def calc_acc(self, output, target):
-        y_pred = torch.round(torch.sigmoid(output))
+        y_pred = torch.argmax(output)
         acc = (y_pred == target).sum().float() / len(target)
         return acc
 
@@ -196,7 +240,8 @@ class G2NetLitModel(pl.LightningModule):
         target = batch["target"]
         data = batch["data"]
         output = self.forward(data)
-        loss = self.loss_fn(target, torch.sigmoid(output))
+        output = F.softmax(output, dim=1)
+        loss = self.loss_fn(target, output)
         acc = self.calc_acc(output, target)
         self.log_dict({"train_loss": loss, "train_acc": acc}, prog_bar=True)
         return loss
@@ -205,8 +250,10 @@ class G2NetLitModel(pl.LightningModule):
         target = batch["target"]
         data = batch["data"]
         output = self.forward(data)
+        output = F.softmax(output, dim=1)
         loss = self.loss_fn(target, output)
         acc = self.calc_acc(output, target)
+
         score = self.score_fn(
             target.detach().cpu().numpy(), output.detach().cpu().numpy()
         )
@@ -217,7 +264,9 @@ class G2NetLitModel(pl.LightningModule):
         )
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(params=self.net.parameters(), lr=self.lr)
+        optimizer = torch.optim.AdamW(
+            params=self.net.parameters(), weight_decay=self.weight_decay, lr=self.lr
+        )
         lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer=optimizer, T_max=self.T_max
         )
@@ -231,9 +280,11 @@ class G2NetLitModel(pl.LightningModule):
 class Config:
     # meta
     seed = 42
+    num_workers: int = 4
     base_dir: Path = Path(".")
     output_dir: Path = base_dir / "output"
     debug: bool = True
+    fold: int = 0
 
     # wandb
     prj_name = utils.get_config().prj_name
@@ -241,14 +292,18 @@ class Config:
 
     # data
     data_dir: Path = base_dir / "input" / "g2net-gravitational-wave-detection"
-    train_data_path: Path = data_dir / "fold_train_df.csv"
+    train_df_path: Path = data_dir / "fold_train_df.csv"
+    test_df_path: Path = data_dir / "sample_submission.csv"
 
     # model
-    backbbone_name: str = "efficientnet_b0"
+    backbone_name: str = "efficientnet_b0"
     pretrained: bool = True
 
     # strategy
+    num_labels: int = 2
     epochs: int = 30
+    train_batch_size: int = 16 * 4
+    valid_batch_size: int = 16 * 4
     fp16: bool = True
 
     # optim
@@ -267,7 +322,6 @@ def train(expname, fold, config):
         log_model=False,
     )
     csv_logger = CSVLogger(save_dir=str(config.base_dir / "logs"), name=expname)
-    loggers = [wandb_logger, csv_logger]
 
     checkpoint = ModelCheckpoint(
         dirpath=str(config.output_dir),
@@ -277,6 +331,7 @@ def train(expname, fold, config):
         monitor="score",
         mode="max",
     )
+
     trainer = Trainer(
         max_epochs=config.epochs if not config.debug else 1,
         precision=16 if config.fp16 else 32,
@@ -289,7 +344,7 @@ def train(expname, fold, config):
         limit_train_batches=0.1 if config.debug else 1.0,
         limit_val_batches=0.1 if config.debug else 1.0,
         callbacks=[checkpoint],
-        logger=loggers,
+        logger=[wandb_logger, csv_logger],
     )
 
     datamodule = MyDataModule(config)
@@ -300,8 +355,10 @@ def train(expname, fold, config):
 def main():
     config = Config()
     runfile_name = Path(__file__)
-    expname = runfile_name.name.split(".")[0] + f"_fold{fold}"
-    train(expname, fold=0, config=config)
+    config.fold = 0
+    expname = runfile_name.name.split(".")[0] + f"_fold{config.fold}"
+    wandb.login(key=utils.get_config().wandb_token)
+    train(expname, fold=config.fold, config=config)
 
 
 if __name__ == "__main__":

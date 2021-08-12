@@ -5,6 +5,8 @@ kaggle_api.sh
 input/
 *.ipynb
 src/utils.py
+logs
+output
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
