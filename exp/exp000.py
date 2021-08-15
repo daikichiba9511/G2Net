@@ -1,6 +1,8 @@
+import os
 import sys
 from dataclasses import dataclass
-from functools import partial
+
+# from functools import partial
 from pathlib import Path
 
 # import librosa
@@ -11,13 +13,15 @@ import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import wandb
-from loguru import logger
+from nnAudio.Spectrogram import CQT
+
+# import wandb
+# from loguru import logger
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.loggers import CSVLogger, WandbLogger
+from pytorch_lightning.loggers import CSVLogger, WandbLogger, tensorboard
 from sklearn.metrics import roc_auc_score
-from nnAudio.Spectrogram import CQT
+
 sys.path.append(str(Path.cwd()))
 from src import utils
 from torch.utils.data import DataLoader, Dataset
@@ -49,7 +53,7 @@ class MyG2NetDataset(Dataset):
             self.target = np.identity(self.num_labels)[df["target"].values]
         self.id = df["id"].values
         self.data_paths = self.get_data_path(self.phase)
-        self.dtype = torch.half
+        self.dtype = torch.float
 
     def __len__(self):
         return len(self.df)
@@ -74,7 +78,7 @@ class MyG2NetDataset(Dataset):
         signal = np.load(path)
         signal = signal / np.max(signal, axis=1).reshape(3, 1)
         signal = np.hstack(signal)
-        return signal.astype("float32")
+        return signal
 
     def get_data(self, index):
         path = self.data_paths[index]
@@ -155,6 +159,7 @@ class MyDataModule(pl.LightningDataModule):
             shuffle=True if phase == "train" else False,
             num_workers=self.num_workers,
             drop_last=True if phase == "train" else False,
+            pin_memory=True,
         )
 
     def train_dataloader(self):
@@ -280,10 +285,11 @@ class G2NetLitModel(pl.LightningModule):
 class Config:
     # meta
     seed = 42
-    num_workers: int = 4
+    num_workers = os.cpu_count() - 2
+    print("num_wokers: num_workers")
     base_dir: Path = Path(".")
     output_dir: Path = base_dir / "output"
-    debug: bool = True
+    debug: bool = False
     fold: int = 0
 
     # wandb
@@ -291,9 +297,10 @@ class Config:
     entity = utils.get_config().entity
 
     # data
-    data_dir: Path = base_dir / "input" / "g2net-gravitational-wave-detection"
-    train_df_path: Path = data_dir / "fold_train_df.csv"
-    test_df_path: Path = data_dir / "sample_submission.csv"
+    data_dir: Path = Path("/content") / "input" / "g2net-gravitational-wave-detection"
+    df_data_dir: Path = Path("./") / "input" / "g2net-gravitational-wave-detection"
+    train_df_path: Path = df_data_dir / "fold_train_df.csv"
+    test_df_path: Path = df_data_dir / "sample_submission.csv"
 
     # model
     backbone_name: str = "efficientnet_b0"
@@ -304,7 +311,7 @@ class Config:
     epochs: int = 30
     train_batch_size: int = 16 * 4
     valid_batch_size: int = 16 * 4
-    fp16: bool = True
+    fp16: bool = False
 
     # optim
     lr: float = 5e-3
@@ -313,16 +320,17 @@ class Config:
 
 
 def train(expname, fold, config):
-    seed_everything(config.seed, workers=True)
-    wandb_logger = WandbLogger(
-        name=expname,
-        save_dir=str(config.output_dir),
-        project=config.prj_name,
-        entity=config.entity,
-        log_model=False,
-    )
+    # wandb_logger = WandbLogger(
+    # name=expname,
+    # save_dir=str(config.output_dir),
+    # project=config.prj_name,
+    # entity=config.entity,
+    # log_model=False,
+    # )
     csv_logger = CSVLogger(save_dir=str(config.base_dir / "logs"), name=expname)
-
+    tensor_logger = tensorboard.TensorBoardLogger(
+        save_dir=str(config.base_dir / "tb_logs"), name=expname
+    )
     checkpoint = ModelCheckpoint(
         dirpath=str(config.output_dir),
         filename=f"{expname}_fold{fold}" + "{epoch:02d}",
@@ -336,15 +344,23 @@ def train(expname, fold, config):
         max_epochs=config.epochs if not config.debug else 1,
         precision=16 if config.fp16 else 32,
         accumulate_grad_batches=1,
-        amp_backend="native",
-        gpus=1,
+        num_sanity_val_steps=0,
+        # amp_backend="native",
+        # gpus=1,
+        tpu_cores=1,
         benchmark=False,
         default_root_dir=Path.cwd(),
         deterministic=True,
         limit_train_batches=0.1 if config.debug else 1.0,
         limit_val_batches=0.1 if config.debug else 1.0,
         callbacks=[checkpoint],
-        logger=[wandb_logger, csv_logger],
+        logger=[
+            # wandb_logger,
+            csv_logger,
+            tensor_logger,
+        ],
+        profiler="xla",
+        progress_bar_refresh_rate=10,
     )
 
     datamodule = MyDataModule(config)
@@ -357,7 +373,8 @@ def main():
     runfile_name = Path(__file__)
     config.fold = 0
     expname = runfile_name.name.split(".")[0] + f"_fold{config.fold}"
-    wandb.login(key=utils.get_config().wandb_token)
+    # wandb.login(key=utils.get_config().wandb_token)
+    seed_everything(config.seed, workers=True)
     train(expname, fold=config.fold, config=config)
 
 

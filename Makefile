@@ -1,6 +1,6 @@
 SHELL=/bin/bash
 POETRY_VERSION=1.1.7
-PACKAGE = loguru wandb flake8 mypy black pyyaml pytorch-lightning \
+PACKAGE = loguru wandb flake8 mypy black pyyaml pytorch-lightning torch-tb-profiler\
 		jupytext madgrad albumentations timm nnAudio
 
 SKLEARN = pip3 uninstall -y scikit-learn \
@@ -33,7 +33,13 @@ set:
 	&& pip3 install -q -U ${PACKAGE}
 
 set_tpu:
-	pip3 install cloud-tpu-client==0.10 https://storage.googleapis.com/tpu-pytorch/wheels/torch_xla-1.8-cp37-cp37m-linux_x86_64.whl
+	pip3 install torch==1.9.0 pytorch-lightning==1.4.2 \
+	&& pip3 install cloud-tpu-client==0.10 https://storage.googleapis.com/tpu-pytorch/wheels/torch_xla-1.9-cp37-cp37m-linux_x86_64.whl \
+	&& sh config.sh \
+	&& pip3 install -q -U ${PACKAGE}
+
+confirm_tpu:
+	python3 -c "import torch; import pytorch_lightning; import torch_xla; print(torch.__version__, ':', pytorch_lightning.__version__, ':', torch_xla.__version__)"
 
 pip_export:
 	pip3 freeze > requirements.txt

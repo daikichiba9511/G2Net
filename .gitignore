@@ -6,6 +6,7 @@ input/
 *.ipynb
 src/utils.py
 logs
+tb_logs
 output
 
 # Byte-compiled / optimized / DLL files
