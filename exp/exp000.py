@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 # from functools import partial
 from pathlib import Path
+from typing import Any, Dict, List
 
 # import librosa
 import numpy as np
@@ -19,13 +20,18 @@ from nnAudio.Spectrogram import CQT
 # from loguru import logger
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.loggers import CSVLogger, WandbLogger, tensorboard
+from pytorch_lightning.loggers import CSVLogger, tensorboard  # , WandbLogger
 from sklearn.metrics import roc_auc_score
 
 sys.path.append(str(Path.cwd()))
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# import torch_xla.debug.metrics as met
 from src import utils
 from torch.utils.data import DataLoader, Dataset
 
+plt.style.use("ggplot")
 
 # ============
 # data
@@ -196,25 +202,30 @@ class G2NetModel(nn.Module):
     def __init__(self, config):
         super(G2NetModel, self).__init__()
         self.backbone_name = config.backbone_name
-        self.backbone = timm.create_model(
-            self.backbone_name, pretrained=config.pretrained, in_chans=1
+        self.model = timm.create_model(
+            self.backbone_name,
+            pretrained=config.pretrained,
+            in_chans=1,
+            # num_classes=0,
+            # global_pool="",
         )
-        self.head = Custom2LinearHead(
-            in_features=1000, hidden_size=256, out_features=config.num_labels
+        self.model.classifier = Custom2LinearHead(
+            in_features=self.model.classifier.in_features,
+            hidden_size=256,
+            out_features=config.num_labels,
         )
         self.wave_transform = CQT(
             sr=2048,
             fmin=20,
-            fmax=1024,
+            fmax=512,
             hop_length=64,
-            bins_per_octave=8,
+            # bins_per_octave=8,
         )
 
     def forward(self, x):
         x = self.wave_transform(x)
         x = x.unsqueeze(1)
-        x = self.backbone(x)
-        output = self.head(x)
+        output = self.model(x)
         return output
 
 
@@ -223,6 +234,8 @@ class G2NetLitModel(pl.LightningModule):
         super(G2NetLitModel, self).__init__()
         # model
         self.net = G2NetModel(config)
+        if config.sync_bn:
+            self.net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.net)
         self.loss_fn = torch.nn.BCEWithLogitsLoss()
         self.score_fn = roc_auc_score
 
@@ -230,6 +243,12 @@ class G2NetLitModel(pl.LightningModule):
         self.lr = config.lr
         self.T_max = config.T_max
         self.weight_decay = config.weight_decay
+
+        # meta
+        self.best_score = -1
+        self.fold = config.expname.split("_")[1]
+        self.exp_name = config.expname
+        self.output_dir = config.output_dir / config.expname.split("_")[0]
 
         self.save_hyperparameters()
 
@@ -245,28 +264,53 @@ class G2NetLitModel(pl.LightningModule):
         target = batch["target"]
         data = batch["data"]
         output = self.forward(data)
-        output = F.softmax(output, dim=1)
+        output = torch.sigmoid(output)
         loss = self.loss_fn(target, output)
         acc = self.calc_acc(output, target)
-        self.log_dict({"train_loss": loss, "train_acc": acc}, prog_bar=True)
+        if self.trainer.is_global_zero:
+            self.log(
+                "train_loss", loss, on_epoch=True, prog_bar=True, rank_zero_only=True
+            )
+            self.log(
+                "train_acc", acc, on_epoch=True, prog_bar=True, rank_zero_only=True
+            )
         return loss
 
     def validation_step(self, batch, batch_idx):
         target = batch["target"]
         data = batch["data"]
         output = self.forward(data)
-        output = F.softmax(output, dim=1)
+        output = torch.sigmoid(output)
         loss = self.loss_fn(target, output)
         acc = self.calc_acc(output, target)
 
-        score = self.score_fn(
-            target.detach().cpu().numpy(), output.detach().cpu().numpy()
-        )
-        self.log_dict(
-            {"valid_loss": loss, "score": score, "valid_acc": acc},
-            on_epoch=True,
-            prog_bar=True,
-        )
+        target = target.detach().cpu().numpy()
+        output = output.detach().cpu().numpy()
+        score = self.score_fn(target, output)
+        if self.trainer.is_global_zero:
+            self.log(
+                "valid_loss", loss, on_epoch=True, prog_bar=True, rank_zero_only=True
+            )
+            self.log("score", score, on_epoch=True, prog_bar=True, rank_zero_only=True)
+            self.log(
+                "valid_acc", acc, on_epoch=True, prog_bar=True, rank_zero_only=True
+            )
+        return {"target": target, "logits": output, "score": score}
+
+    def validation_epoch_end(self, outputs: List[Dict[str, Any]]) -> None:
+        score = np.array([out["score"] for out in outputs])
+        max_score = np.max(score)
+        if max_score > self.best_score:
+            self.best_score = max_score
+            target = np.concatenate([out["target"] for out in outputs])
+            logits = np.concatenate([out["logits"] for out in outputs])
+            plt.subplots(figsize=(10, 8))
+            # sns.distplot(target, label="target", kde=True)
+            sns.distplot(logits, label="logits", kde=True)
+            plt.title("oof plot")
+            plt.legend()
+            plt.savefig(f"./{self.output_dir}/oof_plot_{self.fold}.png")
+            plt.show()
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
@@ -285,12 +329,13 @@ class G2NetLitModel(pl.LightningModule):
 class Config:
     # meta
     seed = 42
-    num_workers = os.cpu_count() - 2
+    num_workers = os.cpu_count()
     print("num_wokers: num_workers")
     base_dir: Path = Path(".")
     output_dir: Path = base_dir / "output"
     debug: bool = False
     fold: int = 0
+    expname: str = ""
 
     # wandb
     prj_name = utils.get_config().prj_name
@@ -303,15 +348,18 @@ class Config:
     test_df_path: Path = df_data_dir / "sample_submission.csv"
 
     # model
-    backbone_name: str = "efficientnet_b0"
+    backbone_name: str = "efficientnet_b7"
     pretrained: bool = True
 
     # strategy
+    sync_bn: bool = False
     num_labels: int = 2
-    epochs: int = 30
-    train_batch_size: int = 16 * 4
-    valid_batch_size: int = 16 * 4
+    epochs: int = 20
+    train_batch_size: int = 8 * 16
+    valid_batch_size: int = 8 * 16
     fp16: bool = False
+    device = "cuda" if torch.cuda.is_available() else "tpu"
+    tpu_cores: int = 1
 
     # optim
     lr: float = 5e-3
@@ -332,7 +380,7 @@ def train(expname, fold, config):
         save_dir=str(config.base_dir / "tb_logs"), name=expname
     )
     checkpoint = ModelCheckpoint(
-        dirpath=str(config.output_dir),
+        dirpath=str(config.output_dir / expname.split("_")[0]),
         filename=f"{expname}_fold{fold}" + "{epoch:02d}",
         save_weights_only=True,
         save_top_k=1,
@@ -344,10 +392,10 @@ def train(expname, fold, config):
         max_epochs=config.epochs if not config.debug else 1,
         precision=16 if config.fp16 else 32,
         accumulate_grad_batches=1,
-        num_sanity_val_steps=0,
-        # amp_backend="native",
-        # gpus=1,
-        tpu_cores=1,
+        num_sanity_val_steps=0 if not config.debug else 2,
+        amp_backend="native",
+        gpus=1 if config.device == "cuda" else 0,
+        tpu_cores=config.tpu_cores if config.device == "tpu" else 0,
         benchmark=False,
         default_root_dir=Path.cwd(),
         deterministic=True,
@@ -359,22 +407,43 @@ def train(expname, fold, config):
             csv_logger,
             tensor_logger,
         ],
-        profiler="xla",
-        progress_bar_refresh_rate=10,
+        progress_bar_refresh_rate=20,
+        # plugins=pl.plugins.training_type.TPUSpawnPlugin(debug=True),
     )
 
     datamodule = MyDataModule(config)
     g2netlitmodel = G2NetLitModel(config)
+    # print(met.metrics_report())
     trainer.fit(datamodule=datamodule, model=g2netlitmodel)
 
 
+def make_args():
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--fold", default=0)
+    parser.add_argument("--tpu_cores", default=1)
+    parser.add_argument("--debug", default=False)
+    args = parser.parse_args()
+    return args
+
+
 def main():
-    config = Config()
     runfile_name = Path(__file__)
-    config.fold = 0
-    expname = runfile_name.name.split(".")[0] + f"_fold{config.fold}"
+
+    # make settings from args
+    args = make_args()
+    fold = args.fold
+    tpu_cores = args.tpu_cores
+    debug = args.debug
+    expname = runfile_name.name.split(".")[0] + f"_fold{fold}"
+
     # wandb.login(key=utils.get_config().wandb_token)
+
+    config = Config(expname=expname, fold=fold, tpu_cores=tpu_cores, debug=debug)
+    (config.output_dir / expname.split("_")[0]).mkdir(parents=True, exist_ok=True)
     seed_everything(config.seed, workers=True)
+    # print(met.metrics_report())
     train(expname, fold=config.fold, config=config)
 
 

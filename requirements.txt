@@ -1,0 +1,14 @@
+loguru
+wandb
+flake8
+mypy
+black
+pyyaml
+pytorch-lightning
+torch-tb-profiler
+jupytext
+madgrad
+albumentations
+timm
+nnAudio
+torchaudio

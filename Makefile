@@ -1,7 +1,5 @@
 SHELL=/bin/bash
 POETRY_VERSION=1.1.7
-PACKAGE = loguru wandb flake8 mypy black pyyaml pytorch-lightning torch-tb-profiler\
-		jupytext madgrad albumentations timm nnAudio
 
 SKLEARN = pip3 uninstall -y scikit-learn \
 	&& pip3 install --pre --extra-index https://pypi.anaconda.org/scipy-wheels-nightly/simple scikit-learn
@@ -11,10 +9,7 @@ POETRY = curl -sSL https://raw.githubusercontent.com/python-poetry/poetry/master
 		&& source ~/.bashrc \
 		&& ${HOME}/.poetry/bin/poetry config virtualenvs.create false
 
-KAGGLE = bash ./kaggle_api.sh \
-		&& pip3 uninstall -y -q kaggle \
-		&& pip3 install --upgrade -q pip \
-		&& pip3 install -q kaggle==1.5.12
+KAGGLE = bash ./kaggle_api.sh
 
 kaggle_api:
 	@${KAGGLE}
@@ -26,17 +21,29 @@ poetry:
 	${POETRY}
 
 develop: # usually use this command
-	pip3 install -q -U ${PACKAGE}
+	pip3 install -q -U -r requirements.txt
 
-set:
+set_gpu:
 	@sh config.sh \
-	&& pip3 install -q -U ${PACKAGE}
+	&& pip3 install -q -U -r requirements.txt
 
-set_tpu:
-	pip3 install torch==1.9.0 pytorch-lightning==1.4.2 \
+init_gpu:
+	bash tmp/config2.sh \
+	&& sh config.sh \
+	&& pip3 install -q -U -r requirements.txt
+
+init_tpu:
+	@bash tmp/config2.sh \
+	&& pip3 install 'torch>=1.3,<1.9' pytorch-lightning \
 	&& pip3 install cloud-tpu-client==0.10 https://storage.googleapis.com/tpu-pytorch/wheels/torch_xla-1.9-cp37-cp37m-linux_x86_64.whl \
 	&& sh config.sh \
-	&& pip3 install -q -U ${PACKAGE}
+	&& pip3 install -q -U -r requirements.txt
+
+set_tpu:
+	pip3 install 'torch>=1.3,<1.9' pytorch-lightning \
+	&& pip3 install cloud-tpu-client==0.10 https://storage.googleapis.com/tpu-pytorch/wheels/torch_xla-1.9-cp37-cp37m-linux_x86_64.whl \
+	&& sh config.sh \
+	&& pip3 install -q -U -r requirements.txt
 
 confirm_tpu:
 	python3 -c "import torch; import pytorch_lightning; import torch_xla; print(torch.__version__, ':', pytorch_lightning.__version__, ':', torch_xla.__version__)"
@@ -54,3 +61,9 @@ clean:
 	rm -rf output/*/*.ckpt
 	rm -rf output/*/wandb
 	rm -rf lightning_logs/
+
+compress:
+	tar cvJf g2net-archive.tar.bz2 input/g2net-gravitational-wave-detection/
+
+decompress:
+	tar xvjf g2net-archive.tar.bz2
